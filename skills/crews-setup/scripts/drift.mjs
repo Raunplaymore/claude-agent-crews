@@ -23,6 +23,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const TEMPLATES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../templates')
@@ -147,12 +148,33 @@ for (const entry of manifest) {
 }
 
 // ---------- 3. gitignore (템플릿 소유 파일에서 유도) ----------
-const expected = manifest.filter((e) => e.owner === '템플릿').map((e) => e.target)
-expected.push('.claude/crews/GENERATED.md')
-const gitignoreLines = new Set(
-  (read(path.join(PROJECT, '.gitignore')) ?? '').split('\n').map((l) => l.trim()),
-)
-out.gitignoreMissing = [...new Set(expected)].filter((e) => !gitignoreLines.has(e))
+// 판정은 `git check-ignore`에 맡긴다. 줄 단위 문자열 비교로는 디렉토리 단위 무시
+// (`.claude/crews/`)가 이미 커버하는 파일을 "누락"으로 오탐한다 — 실제로 발생했다.
+// git이 없거나 저장소가 아니면 줄 비교로 내려간다(그 경우 오탐 가능성을 note에 남긴다).
+const expected = [...new Set([...manifest.filter((e) => e.owner === '템플릿').map((e) => e.target), '.claude/crews/GENERATED.md'])]
+
+const checkIgnoreByGit = (paths) => {
+  try {
+    const res = spawnSync('git', ['-C', PROJECT, 'check-ignore', '--', ...paths], { encoding: 'utf8' })
+    // exit 0 = 하나 이상 무시됨(무시된 경로만 출력), 1 = 무시된 것 없음, 128 = 저장소 아님 등
+    if (res.error || res.status === null || res.status > 1) return null
+    const ignored = new Set(res.stdout.split('\n').map((l) => l.trim()).filter(Boolean))
+    return paths.filter((p) => !ignored.has(p))
+  } catch {
+    return null
+  }
+}
+
+const byGit = checkIgnoreByGit(expected)
+if (byGit) {
+  out.gitignoreMissing = byGit
+} else {
+  const lines = new Set((read(path.join(PROJECT, '.gitignore')) ?? '').split('\n').map((l) => l.trim()))
+  out.gitignoreMissing = expected.filter((e) => !lines.has(e))
+  if (out.gitignoreMissing.length) {
+    out.notes.push('git check-ignore를 쓸 수 없어 줄 단위로 비교했다 — 디렉토리 단위 무시가 있으면 오탐일 수 있다')
+  }
+}
 
 // ---------- 4. codex 공존 divergence ----------
 // 분리(split) 모드를 선택한 프로젝트에서는 이 경고가 유일한 안전장치다.

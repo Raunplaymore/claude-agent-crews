@@ -61,10 +61,14 @@ node skills/crews-setup/scripts/drift.mjs [경로]             # 설치본 ↔ �
 
 ## 지원 도메인
 
-| 도메인 | 상태 |
-|---|---|
-| `embedded-platformio` | 사용 가능 |
-| `web-next` · `web-vite-react` | 감지만 (템플릿 미구현) |
+| 도메인 | 감지 근거 | 상태 |
+|---|---|---|
+| `embedded-platformio` | `platformio.ini` | 사용 가능 |
+| `ml-python` | `pyproject.toml` + ML 의존성 (ultralytics/torch/onnx 등) | 사용 가능 |
+| `web-next` · `web-vite-react` | `package.json` 의존성 | 감지만 (템플릿 미구현) |
+
+감지됐다고 설치하지 않는다 — 템플릿이 없으면 `exit 2`로 멈춘다.
+틀린 프로파일은 없는 프로파일보다 나쁘다.
 
 ## 확장 규칙
 

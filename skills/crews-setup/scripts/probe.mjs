@@ -92,6 +92,81 @@ const multi = (value) =>
     .map((v) => v.trim())
     .filter(Boolean)
 
+// ---------- pyproject 파싱 ----------
+// Node 표준 라이브러리에 TOML 파서가 없다. 필요한 키만 좁게 읽는다
+// (name / requires-python / dependencies / project.scripts). 그 밖의 문법은 다루지 않는다 —
+// 여기서 읽지 못한 사실은 프로파일에 "미측정"으로 남기고 추측하지 않는다.
+const parsePyproject = (text) => {
+  if (!text) return null
+  const out = { name: null, requiresPython: null, dependencies: [], scripts: {} }
+  let section = null
+  let inDeps = false
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (inDeps) {
+      if (line.startsWith(']')) {
+        inDeps = false
+        continue
+      }
+      const dep = line.match(/^["']([^"']+)["']/)
+      if (dep) out.dependencies.push(dep[1])
+      continue
+    }
+    const sec = line.match(/^\[([^\]]+)\]$/)
+    if (sec) {
+      section = sec[1]
+      continue
+    }
+    if (section === 'project') {
+      const name = line.match(/^name\s*=\s*["']([^"']+)["']/)
+      if (name) out.name = name[1]
+      const req = line.match(/^requires-python\s*=\s*["']([^"']+)["']/)
+      if (req) out.requiresPython = req[1]
+      if (/^dependencies\s*=\s*\[/.test(line)) {
+        inDeps = true
+        // 한 줄로 끝나는 경우도 처리
+        const inline = line.slice(line.indexOf('[') + 1)
+        if (inline.includes(']')) {
+          inDeps = false
+          for (const m of inline.matchAll(/["']([^"']+)["']/g)) out.dependencies.push(m[1])
+        }
+      }
+      continue
+    }
+    if (section === 'project.scripts') {
+      const kv = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*["']([^"']+)["']/)
+      if (kv) out.scripts[kv[1]] = kv[2]
+    }
+  }
+  return out
+}
+
+// ---------- Makefile 파싱 ----------
+// ML 프로젝트에서 Makefile은 사실상 조작 인터페이스다. 타깃·기본 변수·필수 변수 가드를 읽는다.
+const parseMakefile = (text) => {
+  if (!text) return null
+  const out = { variables: {}, targets: [] }
+  const lines = text.split('\n')
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]
+    const v = line.match(/^([A-Z][A-Z0-9_]*)\s*\?=\s*(.*)$/)
+    if (v) {
+      out.variables[v[1]] = v[2].trim()
+      continue
+    }
+    const t = line.match(/^([a-zA-Z0-9_-]+):\s*(.*)$/)
+    if (!t || line.startsWith('.PHONY')) continue
+    const prereqs = t[2].trim().split(/\s+/).filter(Boolean)
+    // 레시피 줄에서 필수 변수 가드(test -n "$(VAR)")를 모은다
+    const required = []
+    for (let j = i + 1; j < lines.length && /^\t/.test(lines[j]); j += 1) {
+      for (const m of lines[j].matchAll(/test -n "\$\(([A-Z0-9_]+)\)"/g)) required.push(m[1])
+    }
+    out.targets.push({ name: t[1], prereqs, required: [...new Set(required)] })
+  }
+  return out
+}
+
 // ---------- 도메인 감지 ----------
 const pkg = (() => {
   const text = read('package.json')
@@ -104,12 +179,20 @@ const pkg = (() => {
 })()
 const dep = (name) => Boolean(pkg?.dependencies?.[name] ?? pkg?.devDependencies?.[name])
 
+const pyproject = parsePyproject(read('pyproject.toml'))
+const pyDeps = (pyproject?.dependencies ?? []).map((d) => d.toLowerCase())
+const hasPyDep = (...names) =>
+  names.some((n) => pyDeps.some((d) => d === n || d.startsWith(`${n}[`) || d.startsWith(`${n}>`) || d.startsWith(`${n}=`) || d.startsWith(`${n}<`) || d.startsWith(`${n}~`)))
+
 let domain = null
 let confidence = null
 const notes = []
 
 if (exists('platformio.ini')) {
   domain = 'embedded-platformio'
+  confidence = 'certain'
+} else if (pyproject && hasPyDep('ultralytics', 'torch', 'tensorflow', 'jax', 'transformers', 'scikit-learn', 'onnx')) {
+  domain = 'ml-python'
   confidence = 'certain'
 } else if (dep('next')) {
   domain = 'web-next'
@@ -118,8 +201,9 @@ if (exists('platformio.ini')) {
   domain = 'web-vite-react'
   confidence = 'certain'
 }
-// Phase 0에서 템플릿이 있는 도메인은 embedded-platformio 하나다. 나머지는 감지되더라도 미구현.
-const IMPLEMENTED = new Set(['embedded-platformio'])
+// 템플릿이 실재하는 도메인만 설치 가능하다. 감지됐다고 설치하지 않는다 —
+// 틀린 프로파일은 없는 프로파일보다 나쁘다.
+const IMPLEMENTED = new Set(['embedded-platformio', 'ml-python'])
 
 // ---------- 도메인별 측정 ----------
 const measured = {}
@@ -171,6 +255,50 @@ if (domain === 'embedded-platformio') {
   if (measured.envs.some((e) => !e.board)) notes.push('board가 지정되지 않은 env가 있다')
 }
 
+if (domain === 'ml-python') {
+  const make = parseMakefile(read('Makefile'))
+  measured.package = pyproject.name
+  measured.requiresPython = pyproject.requiresPython
+  measured.pinnedPython = (read('.python-version') ?? '').trim() || null
+  measured.dependencies = pyproject.dependencies
+  measured.entryPoints = pyproject.scripts
+  measured.srcLayout = exists('src')
+  measured.packages = dirs('src').filter((d) => !d.endsWith('.egg-info'))
+  measured.venv = exists('.venv')
+  // 조작 인터페이스: Makefile 타깃 (파이프라인 조합과 필수 변수 가드 포함)
+  measured.make = make
+    ? {
+        variables: make.variables,
+        targets: make.targets.map((t) => ({
+          name: t.name,
+          prereqs: t.prereqs,
+          required: t.required,
+        })),
+      }
+    : null
+  measured.configs = files('configs')
+  measured.scripts = files('scripts')
+  measured.notebooks = files('notebooks').filter((f) => f.endsWith('.ipynb'))
+  measured.docs = files('docs')
+  measured.retrospectives = files('docs/retrospectives')
+  // 데이터·산출물 디렉토리: 존재 여부와 gitignore 여부를 함께 본다
+  //   (커밋되면 안 되는 것이 커밋 대상으로 잡혀 있으면 그 자체가 결함이다)
+  const ignoredLines = new Set(
+    (read('.gitignore') ?? '')
+      .split('\n')
+      .map((l) => l.trim().replace(/\/$/, ''))
+      .filter(Boolean),
+  )
+  measured.dataDirs = ['data', 'artifacts', 'runs', 'samples', 'models', 'reports']
+    .filter((d) => exists(d))
+    .map((d) => ({ dir: d, gitignored: ignoredLines.has(d), sub: dirs(d) }))
+  measured.binaryPatterns = [...ignoredLines].filter((l) => /^\*\.(pt|onnx|hef|har|engine|tflite|pth|ckpt|safetensors)$/.test(l))
+  const unignored = measured.dataDirs.filter((d) => !d.gitignored).map((d) => d.dir)
+  if (unignored.length) notes.push(`데이터/산출물 디렉토리가 gitignore되지 않았다: ${unignored.join(', ')}`)
+  if (!make) notes.push('Makefile 없음 — 실행 명령을 run-profile에 직접 적어야 한다')
+  if (measured.configs.length === 0) notes.push('configs/ 없음 — 설정 주도 파이프라인이 아닐 수 있다')
+}
+
 // ---------- 공존 / 설치 상태 ----------
 const claudeMd = read('CLAUDE.md')
 const coexistence = {
@@ -220,7 +348,69 @@ const result = {
 }
 
 // ---------- MEASURED 블록 렌더링 ----------
+const renderMlPython = (kind) => {
+  const m = measured
+  const L = []
+  const py = m.venv ? '.venv/bin/python' : 'python3'
+  if (kind === 'stack') {
+    L.push(`### 측정값 — \`pyproject.toml\` · \`Makefile\` (측정: ${today})`)
+    L.push('')
+    L.push(`- 패키지: \`${m.package ?? '-'}\` · requires-python: \`${m.requiresPython ?? '-'}\`${m.pinnedPython ? ` · 고정 버전: \`${m.pinnedPython}\`` : ''}`)
+    L.push(`- 레이아웃: ${m.srcLayout ? `src 레이아웃 — \`src/${m.packages.join('`, `src/')}\`` : '평면 레이아웃'} · venv: ${m.venv ? '`.venv/`' : '없음'}`)
+    if (Object.keys(m.entryPoints).length) {
+      L.push(`- 진입점: ${Object.entries(m.entryPoints).map(([k, v]) => `\`${k}\` → \`${v}\``).join(', ')}`)
+    }
+    L.push(`- 의존성(${m.dependencies.length}): ${m.dependencies.map((d) => `\`${d}\``).join(', ') || '(없음)'}`)
+    if (m.configs.length) {
+      L.push('')
+      L.push(`- 설정 파일 ${m.configs.length}개: ${m.configs.map((f) => `\`configs/${f}\``).join(', ')}`)
+      if (m.make?.variables?.CONFIG) L.push(`  - Makefile 기본 설정: \`${m.make.variables.CONFIG}\` (\`make CONFIG=...\`로 교체)`)
+    }
+    if (m.dataDirs.length) {
+      L.push('')
+      L.push('| 디렉토리 | 하위 | gitignore |')
+      L.push('|---|---|---|')
+      for (const d of m.dataDirs) {
+        L.push(`| \`${d.dir}/\` | ${d.sub.map((s) => `\`${s}\``).join(', ') || '-'} | ${d.gitignored ? 'O' : '**X — 확인 필요**'} |`)
+      }
+    }
+    if (m.binaryPatterns.length) L.push(`\n- 커밋 금지 바이너리 패턴: ${m.binaryPatterns.map((p) => `\`${p}\``).join(', ')}`)
+    if (m.notebooks.length) L.push(`- 노트북: ${m.notebooks.map((f) => `\`${f}\``).join(', ')}`)
+    if (m.scripts.length) L.push(`- \`scripts/\` ${m.scripts.length}개 (Makefile 타깃에서 호출)`)
+    if (m.docs.length) L.push(`- \`docs/\`: ${m.docs.map((f) => `\`${f}\``).join(', ')}`)
+    if (m.retrospectives.length) L.push(`- \`docs/retrospectives/\` ${m.retrospectives.length}개 — 과거 판단 근거가 여기 있다`)
+    return L.join('\n')
+  }
+  if (kind === 'run') {
+    L.push(`### 명령 — 측정값에서 유도 (측정: ${today})`)
+    L.push('')
+    L.push(`- 인터프리터: \`${py}\`${m.venv ? '' : ' (venv 없음 — 생성 여부 확인)'}`)
+    if (m.make) {
+      const pipeline = m.make.targets.find((t) => t.name === 'pipeline')
+      if (pipeline?.prereqs.length) {
+        L.push(`- 파이프라인 순서: ${pipeline.prereqs.map((p) => `\`${p}\``).join(' → ')}  (\`make pipeline\`)`)
+      }
+      L.push('')
+      L.push('| 타깃 | 명령 | 필수 변수 |')
+      L.push('|---|---|---|')
+      for (const t of m.make.targets) {
+        if (t.name === 'pipeline') continue
+        L.push(`| \`${t.name}\` | \`make ${t.name}\` | ${t.required.length ? t.required.map((r) => `\`${r}=\``).join(' ') : '-'} |`)
+      }
+      L.push('')
+      L.push('> 필수 변수가 있는 타깃은 변수를 빼면 `exit 2`로 멈춘다 — 값을 추측해 넣지 말고 사용자에게 묻는다.')
+      const vars = Object.entries(m.make.variables)
+      if (vars.length) L.push(`\n- Makefile 기본 변수: ${vars.map(([k, v]) => `\`${k}=${v}\``).join(', ')}`)
+    } else {
+      L.push(`- 실행: \`${py} -m {패키지} ...\` (Makefile 없음 — 명령을 직접 채울 것)`)
+    }
+    return L.join('\n')
+  }
+  return null
+}
+
 const renderMeasured = (kind) => {
+  if (domain === 'ml-python') return renderMlPython(kind)
   if (domain !== 'embedded-platformio') return null
   const L = []
   if (kind === 'stack') {
@@ -310,6 +500,18 @@ if (asJson) {
     if (measured.configPairs.length) L.push(`  설정쌍:   ${measured.configPairs.map((p) => `${p.example} → ${p.actual}`).join(', ')}`)
     if (measured.companions.length) L.push(`  동반:     ${measured.companions.map((c) => `${c.dir}(${c.scripts.join('/') || 'scripts 없음'})`).join(', ')}`)
     if (measured.deployFiles.length) L.push(`  deploy/:  ${measured.deployFiles.join(', ')}`)
+  }
+  if (domain === 'ml-python') {
+    L.push(`패키지:   ${measured.package} (python ${measured.requiresPython}${measured.pinnedPython ? `, 고정 ${measured.pinnedPython}` : ''}) venv=${measured.venv ? 'O' : 'X'}`)
+    L.push(`  의존성:   ${measured.dependencies.length}개 — ${measured.dependencies.slice(0, 4).join(', ')}${measured.dependencies.length > 4 ? ' …' : ''}`)
+    if (measured.make) {
+      const pipeline = measured.make.targets.find((t) => t.name === 'pipeline')
+      L.push(`  make:     타깃 ${measured.make.targets.length}개${pipeline ? ` · pipeline = ${pipeline.prereqs.join(' → ')}` : ''}`)
+      const guarded = measured.make.targets.filter((t) => t.required.length)
+      if (guarded.length) L.push(`  필수변수: ${guarded.map((t) => `${t.name}(${t.required.join(',')})`).join(' ')}`)
+    }
+    L.push(`  configs:  ${measured.configs.join(', ') || '(없음)'}`)
+    L.push(`  데이터:   ${measured.dataDirs.map((d) => `${d.dir}${d.gitignored ? '' : '(!미무시)'}`).join(', ') || '(없음)'}`)
   }
   L.push(`공존:     codex=${coexistence.codexStackProfile ? 'O' : 'X'} crews=${coexistence.claudeCrews ? 'O' : 'X'} CLAUDE.md=${coexistence.claudeMd ? 'O' : 'X'} AGENTS.md=${coexistence.agentsMd ? 'O' : 'X'} 마커=${coexistence.markerBlocks}`)
   L.push(`gitignore 누락: ${gitignore.missing.length ? gitignore.missing.join(', ') : '없음'}`)
